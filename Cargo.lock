@@ -106,6 +106,7 @@ dependencies = [
  "dirs",
  "ksni",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",

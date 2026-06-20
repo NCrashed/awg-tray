@@ -2,6 +2,7 @@ mod autostart;
 mod config;
 mod icon;
 mod tray;
+mod vless;
 mod vpn;
 
 use std::path::PathBuf;
@@ -44,8 +45,8 @@ async fn main() {
         std::process::exit(1);
     }
 
-    if vpn::discover_configs(&config_dir).is_empty() {
-        warn!("No .conf files found in {}", config_dir.display());
+    if vpn::discover_servers(&config_dir).is_empty() {
+        warn!("No .conf or .vless files found in {}", config_dir.display());
     }
 
     let (action_tx, action_rx) = mpsc::unbounded_channel();
@@ -150,22 +151,36 @@ async fn handle_actions(
 
                 // Disconnect current if any
                 if let Some(current_server) = &current {
-                    let path = config_dir.join(format!("{current_server}.conf"));
-                    if let Err(e) = vpn::disconnect(&path).await {
-                        warn!("Failed to disconnect {current_server}: {e}");
-                        let prev = current_server.clone();
-                        handle
-                            .update(move |tray| {
-                                tray.status = VpnStatus::Connected(prev);
-                            })
-                            .await;
-                        continue;
+                    match vpn::find_server(&config_dir, current_server) {
+                        Some(srv) => {
+                            if let Err(e) = vpn::disconnect(&srv).await {
+                                warn!("Failed to disconnect {current_server}: {e}");
+                                let prev = current_server.clone();
+                                handle
+                                    .update(move |tray| {
+                                        tray.status = VpnStatus::Connected(prev);
+                                    })
+                                    .await;
+                                continue;
+                            }
+                        }
+                        None => warn!(
+                            "Active server {current_server} no longer exists; skipping disconnect"
+                        ),
                     }
                 }
 
                 // Connect to new server
-                let path = config_dir.join(format!("{server}.conf"));
-                match vpn::connect(&path).await {
+                let Some(target) = vpn::find_server(&config_dir, &server) else {
+                    warn!("Server {server} not found");
+                    handle
+                        .update(|tray| {
+                            tray.status = VpnStatus::Disconnected;
+                        })
+                        .await;
+                    continue;
+                };
+                match vpn::connect(&target).await {
                     Ok(()) => {
                         let s = server.clone();
                         handle
@@ -192,8 +207,11 @@ async fn handle_actions(
                     .flatten();
 
                 if let Some(server) = current {
-                    let path = config_dir.join(format!("{server}.conf"));
-                    match vpn::disconnect(&path).await {
+                    let Some(target) = vpn::find_server(&config_dir, &server) else {
+                        warn!("Server {server} not found; cannot disconnect");
+                        continue;
+                    };
+                    match vpn::disconnect(&target).await {
                         Ok(()) => {
                             handle
                                 .update(|tray| {
@@ -245,7 +263,11 @@ async fn poll_status(
                     return; // don't override transitional state
                 }
                 if tray.status != new_status {
-                    info!("Status changed: {} → {}", tray.status.label(), new_status.label());
+                    info!(
+                        "Status changed: {} → {}",
+                        tray.status.label(),
+                        new_status.label()
+                    );
                     tray.status = new_status;
                 }
             })

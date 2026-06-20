@@ -6,9 +6,9 @@ const SIZE: i32 = 22;
 /// Returns a ksni::Icon with ARGB32 pixel data.
 pub fn status_icon(status: &VpnStatus) -> ksni::Icon {
     let (r, g, b) = match status {
-        VpnStatus::Connected(_) => (0x2eu8, 0xcc, 0x71),  // green
-        VpnStatus::Disconnected => (0xe7, 0x4c, 0x3c),    // red
-        VpnStatus::Connecting(_) => (0xf3, 0x9c, 0x12),   // amber
+        VpnStatus::Connected(_) => (0x2eu8, 0xcc, 0x71), // green
+        VpnStatus::Disconnected => (0xe7, 0x4c, 0x3c),   // red
+        VpnStatus::Connecting(_) => (0xf3, 0x9c, 0x12),  // amber
     };
 
     let mut data = Vec::with_capacity((SIZE * SIZE * 4) as usize);
