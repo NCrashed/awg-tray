@@ -148,6 +148,7 @@ async fn handle_actions(
                         tray.status = VpnStatus::Connecting(server_clone);
                     })
                     .await;
+                let connecting_since = std::time::Instant::now();
 
                 // Disconnect current if any
                 if let Some(current_server) = &current {
@@ -182,6 +183,19 @@ async fn handle_actions(
                 };
                 match vpn::connect(&target).await {
                     Ok(()) => {
+                        // Some tray hosts (GNOME AppIndicator) coalesce two NewIcon
+                        // signals that arrive within a few dozen ms and drop the
+                        // second, leaving the icon stuck on the amber "connecting"
+                        // colour. WireGuard's awg-quick is slow enough to avoid this;
+                        // VLESS via systemd-run returns in ~20ms, so keep the
+                        // connecting state visible briefly before flipping to green.
+                        const MIN_CONNECTING: std::time::Duration =
+                            std::time::Duration::from_millis(600);
+                        if let Some(remaining) =
+                            MIN_CONNECTING.checked_sub(connecting_since.elapsed())
+                        {
+                            tokio::time::sleep(remaining).await;
+                        }
                         let s = server.clone();
                         handle
                             .update(move |tray| {

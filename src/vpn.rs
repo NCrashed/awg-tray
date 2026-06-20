@@ -265,15 +265,69 @@ async fn vless_connect(server: &Server) -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to spawn sudo systemd-run: {e}"))?;
 
-    if output.status.success() {
-        info!("VLESS unit {unit} started");
-        Ok(())
-    } else {
+    if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!(
+        return Err(format!(
             "systemd-run failed (exit {}): {stderr}",
             output.status.code().unwrap_or(-1)
-        ))
+        ));
+    }
+
+    info!("VLESS unit {unit} started; verifying it stays active…");
+    if let Err(e) = wait_unit_active(&unit).await {
+        // Leave a clean state: stop a failed/stuck unit before reporting.
+        let _ = Command::new("sudo")
+            .args(["systemctl", "stop", &unit])
+            .output()
+            .await;
+        return Err(e);
+    }
+    info!("VLESS unit {unit} is active");
+    Ok(())
+}
+
+/// Confirm sing-box actually came up, rather than trusting that `systemd-run`
+/// merely enqueued the start job. Catches a bad config, a missing binary, or an
+/// immediate crash-loop (which `Restart=on-failure` would otherwise mask).
+async fn wait_unit_active(unit: &str) -> Result<(), String> {
+    // Grace period: let sing-box either establish or crash-loop into "failed"
+    // before the first check, so a fast-failing process isn't seen as "active".
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+    for _ in 0..16 {
+        let out = Command::new("systemctl")
+            .args(["is-active", unit])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to query {unit}: {e}"))?;
+        match String::from_utf8_lossy(&out.stdout).trim() {
+            "active" => return Ok(()),
+            "failed" => {
+                return Err(format!(
+                    "sing-box unit {unit} failed to start: {}",
+                    unit_log_tail(unit).await
+                ));
+            }
+            // "activating"/"auto-restart"/"inactive": still settling — keep waiting.
+            _ => tokio::time::sleep(std::time::Duration::from_millis(300)).await,
+        }
+    }
+    Err(format!(
+        "sing-box unit {unit} did not become active in time"
+    ))
+}
+
+/// Best-effort: grab the last few journal lines for a unit to explain a failure.
+async fn unit_log_tail(unit: &str) -> String {
+    match Command::new("journalctl")
+        .args(["-u", unit, "--no-pager", "-n", "3", "-o", "cat"])
+        .output()
+        .await
+    {
+        Ok(o) if !o.stdout.is_empty() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .replace('\n', " | "),
+        _ => "(no journal output)".to_string(),
     }
 }
 
