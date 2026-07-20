@@ -8,6 +8,17 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
+/// Destinations kept out of the TUN so the LAN stays reachable while connected:
+/// RFC1918 private ranges plus IPv4/IPv6 link-local.
+const LOCAL_EXCLUDES: &[&str] = &[
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "fe80::/10",
+    "fc00::/7",
+];
+
 /// A parsed `vless://` share link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VlessLink {
@@ -205,6 +216,12 @@ impl VlessLink {
             "stack": "gvisor"
         });
 
+        // Keep the local network off the tunnel. auto_route otherwise pulls every
+        // destination (LAN included) into the TUN, so a host like 192.168.1.12
+        // becomes unreachable while connected. Excluding RFC1918 + link-local
+        // leaves LAN routing on the physical interface's main table.
+        let mut exclude: Vec<String> = LOCAL_EXCLUDES.iter().map(|s| s.to_string()).collect();
+
         if let Some(ip) = server_ip {
             // Connect to the server by its pre-resolved IP (no DNS needed to dial
             // the proxy)...
@@ -217,8 +234,10 @@ impl VlessLink {
             } else {
                 format!("{ip}/32")
             };
-            tun["route_exclude_address"] = json!([cidr]);
+            exclude.push(cidr);
         }
+
+        tun["route_exclude_address"] = json!(exclude);
 
         json!({
             "log": { "level": "warn", "timestamp": true },
@@ -364,16 +383,29 @@ mod tests {
         assert_eq!(out["tls"]["server_name"], "cdn14.supermegacdn.com");
         assert_eq!(out["tls"]["utls"]["fingerprint"], "firefox");
         assert_eq!(cfg["inbounds"][0]["interface_name"], "tun-vless");
-        // The server IP must be excluded from the TUN to avoid a routing loop.
-        assert_eq!(cfg["inbounds"][0]["route_exclude_address"][0], "1.2.3.4/32");
+        // LAN ranges are excluded so the local network stays reachable, and the
+        // server IP is appended so its dial escapes the tunnel (no routing loop).
+        let excludes = cfg["inbounds"][0]["route_exclude_address"]
+            .as_array()
+            .unwrap();
+        assert!(excludes.iter().any(|v| v == "192.168.0.0/16"));
+        assert!(excludes.iter().any(|v| v == "1.2.3.4/32"));
     }
 
     #[test]
-    fn no_exclude_without_resolved_ip() {
+    fn excludes_lan_without_resolved_ip() {
         let l = VlessLink::parse(SAMPLE).unwrap();
         let cfg = l.to_singbox_config("tun-vless", None);
         assert_eq!(cfg["outbounds"][0]["server"], "po.superbhost.xyz");
-        assert!(cfg["inbounds"][0]["route_exclude_address"].is_null());
+        // Even without a pre-resolved server IP, the LAN stays carved out.
+        let excludes = cfg["inbounds"][0]["route_exclude_address"]
+            .as_array()
+            .unwrap();
+        assert!(excludes.iter().any(|v| v == "192.168.0.0/16"));
+        // No server IP means no /32 host entry, only the LAN ranges.
+        assert!(!excludes
+            .iter()
+            .any(|v| v.as_str().unwrap().ends_with("/32")));
     }
 
     #[test]
