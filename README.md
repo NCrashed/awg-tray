@@ -7,6 +7,7 @@ System tray manager for [AmneziaWireGuard](https://amnezia.org/) and
 - Connect, disconnect, and switch between servers
 - Auto-discovers `.conf` (WireGuard) and `.vless` (VLESS) files in your config directory
 - VLESS support (incl. Reality + `xtls-rprx-vision`) via [sing-box](https://sing-box.sagernet.org/) in a full-tunnel TUN
+- Split tunneling: let chosen apps (e.g. Steam) bypass the tunnel — VLESS mode only
 - Optional autostart at login
 
 ## NixOS Setup
@@ -123,6 +124,26 @@ poll_interval_secs = 5
 
 CLI flags override the config file.
 
+### Split tunneling (bypass apps)
+
+The **Bypass VPN (VLESS)** submenu lists apps whose traffic can skip the tunnel
+and go out the physical interface directly — useful for letting Steam download a
+game at line speed while everything else stays on the VPN. Toggles are saved to
+the config file; if a VLESS tunnel is active, it restarts automatically with the
+new rules (WireGuard servers don't support this — the list only applies to
+VLESS connections).
+
+Steam, qBittorrent, and Transmission are pre-configured. Add your own apps in
+`config.toml` — `processes` are executable names as the kernel sees them
+(check with `ps -o comm=` or `readlink /proc/<pid>/exe`):
+
+```toml
+[[bypass_apps]]
+name = "Discord"
+processes = ["Discord"]
+enabled = false
+```
+
 ## How It Works
 
 - **WireGuard servers** (`.conf`): brought up/down with `sudo awg-quick up/down`.
@@ -137,6 +158,11 @@ CLI flags override the config file.
 - **VLESS server reachability**: the generated config dials the server by its
   pre-resolved IP and excludes that IP from the TUN (`route_exclude_address`) so
   the proxy's own connection escapes the tunnel instead of looping back in.
+- **Split tunneling**: enabled bypass apps become a sing-box route rule
+  (`process_name` → `direct` outbound). sing-box identifies the owning process
+  of each connection via `/proc` (it runs as root, so this always works). DNS
+  from bypassed apps is still answered through the tunnel; only the actual
+  traffic goes direct.
 - **Status detection**: polls every 5 seconds (configurable)
 - **Privilege escalation**: passwordless `sudo` for `awg-quick` / `systemd-run` /
   `systemctl` (requires sudoers rules — see NixOS Setup)

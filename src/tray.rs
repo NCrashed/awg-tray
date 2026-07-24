@@ -13,6 +13,8 @@ pub enum VpnAction {
     Connect(String),
     Disconnect,
     ToggleAutostart,
+    /// Toggle bypass (split tunneling) for the named app.
+    ToggleBypass(String),
     Quit,
 }
 
@@ -20,6 +22,8 @@ pub struct VpnTray {
     pub status: VpnStatus,
     pub autostart: bool,
     pub config_dir: PathBuf,
+    /// Bypass apps as (name, enabled), mirroring the config.
+    pub bypass_apps: Vec<(String, bool)>,
     pub action_tx: mpsc::UnboundedSender<VpnAction>,
 }
 
@@ -100,6 +104,44 @@ impl ksni::Tray for VpnTray {
                     }
                 }),
                 options,
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        items.push(ksni::MenuItem::Separator);
+
+        // Split tunneling: apps whose traffic skips the tunnel. Applies to
+        // VLESS servers only (sing-box process routing); toggling while a
+        // VLESS tunnel is up restarts it with the new rules.
+        let bypass_items: Vec<ksni::MenuItem<Self>> = if self.bypass_apps.is_empty() {
+            vec![StandardItem {
+                label: "No apps configured".into(),
+                enabled: false,
+                ..Default::default()
+            }
+            .into()]
+        } else {
+            self.bypass_apps
+                .iter()
+                .map(|(name, enabled)| {
+                    let app = name.clone();
+                    CheckmarkItem {
+                        label: name.clone(),
+                        checked: *enabled,
+                        activate: Box::new(move |tray: &mut Self| {
+                            let _ = tray.action_tx.send(VpnAction::ToggleBypass(app.clone()));
+                        }),
+                        ..Default::default()
+                    }
+                    .into()
+                })
+                .collect()
+        };
+        items.push(
+            SubMenu {
+                label: "Bypass VPN (VLESS)".into(),
+                submenu: bypass_items,
                 ..Default::default()
             }
             .into(),

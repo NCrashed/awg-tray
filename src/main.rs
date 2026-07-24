@@ -34,7 +34,9 @@ async fn main() {
     let cli = Cli::parse();
     let app_config = AppConfig::load();
 
-    let config_dir = cli.config_dir.unwrap_or(app_config.config_dir);
+    let config_dir = cli
+        .config_dir
+        .unwrap_or_else(|| app_config.config_dir.clone());
     let poll_interval = std::time::Duration::from_secs(app_config.poll_interval_secs);
 
     info!("Config directory: {}", config_dir.display());
@@ -51,13 +53,19 @@ async fn main() {
 
     let (action_tx, action_rx) = mpsc::unbounded_channel();
 
-    let handle = spawn_tray_with_retry(&config_dir, &action_tx).await;
+    let bypass_apps = bypass_states(&app_config);
+    let handle = spawn_tray_with_retry(&config_dir, &action_tx, &bypass_apps).await;
     info!("Tray spawned successfully");
 
     // Spawn the action handler
     let action_handle = handle.clone();
     let action_config_dir = config_dir.clone();
-    tokio::spawn(handle_actions(action_rx, action_handle, action_config_dir));
+    tokio::spawn(handle_actions(
+        action_rx,
+        action_handle,
+        action_config_dir,
+        app_config,
+    ));
 
     // Spawn the status poller
     let poll_handle = handle.clone();
@@ -68,15 +76,26 @@ async fn main() {
     std::future::pending::<()>().await;
 }
 
+/// Bypass apps as (name, enabled) pairs for display in the tray menu.
+fn bypass_states(config: &AppConfig) -> Vec<(String, bool)> {
+    config
+        .bypass_apps
+        .iter()
+        .map(|a| (a.name.clone(), a.enabled))
+        .collect()
+}
+
 fn build_tray(
     config_dir: &PathBuf,
     action_tx: &mpsc::UnboundedSender<VpnAction>,
     status: VpnStatus,
+    bypass_apps: Vec<(String, bool)>,
 ) -> VpnTray {
     VpnTray {
         status,
         autostart: autostart::is_enabled(),
         config_dir: config_dir.clone(),
+        bypass_apps,
         action_tx: action_tx.clone(),
     }
 }
@@ -84,11 +103,12 @@ fn build_tray(
 async fn spawn_tray_with_retry(
     config_dir: &PathBuf,
     action_tx: &mpsc::UnboundedSender<VpnAction>,
+    bypass_apps: &[(String, bool)],
 ) -> ksni::Handle<VpnTray> {
     let status = vpn::detect_status(config_dir).await;
     info!("Initial status: {}", status.label());
 
-    let tray = build_tray(config_dir, action_tx, status);
+    let tray = build_tray(config_dir, action_tx, status, bypass_apps.to_vec());
     match tray.spawn().await {
         Ok(h) => return h,
         Err(e) => {
@@ -105,7 +125,7 @@ async fn spawn_tray_with_retry(
         info!("Retry {attempt}/{TRAY_MAX_RETRIES}…");
 
         let status = vpn::detect_status(config_dir).await;
-        let tray = build_tray(config_dir, action_tx, status);
+        let tray = build_tray(config_dir, action_tx, status, bypass_apps.to_vec());
         match tray.spawn().await {
             Ok(h) => return h,
             Err(e) => {
@@ -126,6 +146,7 @@ async fn handle_actions(
     mut rx: mpsc::UnboundedReceiver<VpnAction>,
     handle: ksni::Handle<VpnTray>,
     config_dir: PathBuf,
+    mut app_config: AppConfig,
 ) {
     while let Some(action) = rx.recv().await {
         match action {
@@ -181,7 +202,7 @@ async fn handle_actions(
                         .await;
                     continue;
                 };
-                match vpn::connect(&target).await {
+                match vpn::connect(&target, &app_config.enabled_bypass_processes()).await {
                     Ok(()) => {
                         // Some tray hosts (GNOME AppIndicator) coalesce two NewIcon
                         // signals that arrive within a few dozen ms and drop the
@@ -236,6 +257,67 @@ async fn handle_actions(
                         Err(e) => {
                             warn!("Failed to disconnect: {e}");
                         }
+                    }
+                }
+            }
+
+            VpnAction::ToggleBypass(name) => {
+                if !app_config.toggle_bypass(&name) {
+                    warn!("Unknown bypass app: {name}");
+                    continue;
+                }
+                if let Err(e) = app_config.save() {
+                    warn!("Failed to save config: {e}");
+                }
+                let states = bypass_states(&app_config);
+                handle
+                    .update(move |tray| {
+                        tray.bypass_apps = states;
+                    })
+                    .await;
+
+                // A running VLESS tunnel needs a restart to pick up the new
+                // routing rules; WireGuard doesn't support bypass at all.
+                let current = handle
+                    .update(|tray| tray.status.active_server().map(String::from))
+                    .await
+                    .flatten();
+                let Some(server) = current else { continue };
+                let Some(target) = vpn::find_server(&config_dir, &server) else {
+                    continue;
+                };
+                if target.kind != vpn::ServerKind::Vless {
+                    continue;
+                }
+
+                info!("Restarting {server} to apply bypass change");
+                let s = server.clone();
+                handle
+                    .update(move |tray| {
+                        tray.status = VpnStatus::Connecting(s);
+                    })
+                    .await;
+
+                let result = match vpn::disconnect(&target).await {
+                    Ok(()) => vpn::connect(&target, &app_config.enabled_bypass_processes()).await,
+                    Err(e) => Err(e),
+                };
+                match result {
+                    Ok(()) => {
+                        let s = server.clone();
+                        handle
+                            .update(move |tray| {
+                                tray.status = VpnStatus::Connected(s);
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!("Failed to restart {server} after bypass change: {e}");
+                        handle
+                            .update(|tray| {
+                                tray.status = VpnStatus::Disconnected;
+                            })
+                            .await;
                     }
                 }
             }

@@ -197,7 +197,17 @@ impl VlessLink {
     /// pre-resolved IP. This is important under TUN: resolving the proxy
     /// hostname *after* the tunnel is up deadlocks (the lookup is hijacked back
     /// into sing-box's DNS, which can't answer until the proxy connects).
-    pub fn to_singbox_config(&self, tun_iface: &str, server_ip: Option<&str>) -> Value {
+    ///
+    /// `bypass_processes` are executable names whose traffic is routed to the
+    /// `direct` outbound instead of the proxy (split tunneling). Process
+    /// matching needs to read `/proc`, which works because the sing-box unit
+    /// runs as root.
+    pub fn to_singbox_config(
+        &self,
+        tun_iface: &str,
+        server_ip: Option<&str>,
+        bypass_processes: &[String],
+    ) -> Value {
         let mut proxy = self.outbound();
 
         let mut tun = json!({
@@ -239,6 +249,14 @@ impl VlessLink {
 
         tun["route_exclude_address"] = json!(exclude);
 
+        let mut rules = vec![
+            json!({ "action": "sniff" }),
+            json!({ "protocol": "dns", "action": "hijack-dns" }),
+        ];
+        if !bypass_processes.is_empty() {
+            rules.push(json!({ "process_name": bypass_processes, "outbound": "direct" }));
+        }
+
         json!({
             "log": { "level": "warn", "timestamp": true },
             "dns": {
@@ -258,10 +276,7 @@ impl VlessLink {
                 { "type": "direct", "tag": "direct" }
             ],
             "route": {
-                "rules": [
-                    { "action": "sniff" },
-                    { "protocol": "dns", "action": "hijack-dns" }
-                ],
+                "rules": rules,
                 "auto_detect_interface": true,
                 // Resolve outbound server domains (incl. the proxy host) locally.
                 "default_domain_resolver": "local",
@@ -368,7 +383,7 @@ mod tests {
     #[test]
     fn builds_singbox_config() {
         let l = VlessLink::parse(SAMPLE).unwrap();
-        let cfg = l.to_singbox_config("tun-vless", Some("1.2.3.4"));
+        let cfg = l.to_singbox_config("tun-vless", Some("1.2.3.4"), &[]);
         let out = &cfg["outbounds"][0];
         assert_eq!(out["type"], "vless");
         // server is the pre-resolved IP; SNI stays the reality hostname.
@@ -395,7 +410,7 @@ mod tests {
     #[test]
     fn excludes_lan_without_resolved_ip() {
         let l = VlessLink::parse(SAMPLE).unwrap();
-        let cfg = l.to_singbox_config("tun-vless", None);
+        let cfg = l.to_singbox_config("tun-vless", None, &[]);
         assert_eq!(cfg["outbounds"][0]["server"], "po.superbhost.xyz");
         // Even without a pre-resolved server IP, the LAN stays carved out.
         let excludes = cfg["inbounds"][0]["route_exclude_address"]
@@ -406,6 +421,27 @@ mod tests {
         assert!(!excludes
             .iter()
             .any(|v| v.as_str().unwrap().ends_with("/32")));
+    }
+
+    #[test]
+    fn bypass_processes_route_direct() {
+        let l = VlessLink::parse(SAMPLE).unwrap();
+        let bypass = vec!["steam".to_string(), "steamwebhelper".to_string()];
+        let cfg = l.to_singbox_config("tun-vless", Some("1.2.3.4"), &bypass);
+        let rules = cfg["route"]["rules"].as_array().unwrap();
+        let rule = rules
+            .iter()
+            .find(|r| r.get("process_name").is_some())
+            .expect("bypass rule present");
+        assert_eq!(rule["process_name"], json!(["steam", "steamwebhelper"]));
+        assert_eq!(rule["outbound"], "direct");
+        // Everything else still goes to the proxy.
+        assert_eq!(cfg["route"]["final"], "proxy");
+
+        // No rule at all when the list is empty.
+        let cfg = l.to_singbox_config("tun-vless", Some("1.2.3.4"), &[]);
+        let rules = cfg["route"]["rules"].as_array().unwrap();
+        assert!(rules.iter().all(|r| r.get("process_name").is_none()));
     }
 
     #[test]

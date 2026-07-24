@@ -127,10 +127,12 @@ async fn vless_is_up(name: &str) -> bool {
     }
 }
 
-pub async fn connect(server: &Server) -> Result<(), String> {
+/// `bypass_processes` — executable names routed around the tunnel (split
+/// tunneling). Only the VLESS backend supports it; WireGuard ignores the list.
+pub async fn connect(server: &Server, bypass_processes: &[String]) -> Result<(), String> {
     match server.kind {
         ServerKind::Wireguard => run_awg_quick("up", &server.path).await,
-        ServerKind::Vless => vless_connect(server).await,
+        ServerKind::Vless => vless_connect(server, bypass_processes).await,
     }
 }
 
@@ -220,7 +222,7 @@ fn vless_runtime_dir() -> PathBuf {
         .join("awg-tray")
 }
 
-async fn vless_connect(server: &Server) -> Result<(), String> {
+async fn vless_connect(server: &Server, bypass_processes: &[String]) -> Result<(), String> {
     let raw = tokio::fs::read_to_string(&server.path)
         .await
         .map_err(|e| format!("Failed to read {}: {e}", server.path.display()))?;
@@ -229,7 +231,13 @@ async fn vless_connect(server: &Server) -> Result<(), String> {
     // Resolve the server hostname now, before the TUN is up — resolving it
     // afterwards deadlocks against the tunnel's DNS hijack.
     let server_ip = resolve_host(&link.host, link.port).await;
-    let config = link.to_singbox_config(VLESS_TUN, server_ip.as_deref());
+    if !bypass_processes.is_empty() {
+        info!(
+            "Bypassing tunnel for processes: {}",
+            bypass_processes.join(", ")
+        );
+    }
+    let config = link.to_singbox_config(VLESS_TUN, server_ip.as_deref(), bypass_processes);
     let json = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("Failed to serialize sing-box config: {e}"))?;
 
